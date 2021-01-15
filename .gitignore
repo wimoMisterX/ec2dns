@@ -75,3 +75,5 @@ venv.bak/
 
 # vim swap files
 *.sw*
+
+aws-credentials
