@@ -2,9 +2,12 @@ import argparse
 import boto3
 import re
 import json
+import logging
 
 from twisted.internet import reactor, defer
 from twisted.names import client, cache, dns, error, server
+
+logger = logging.getLogger(__name__)
 
 
 class DynamicResolver(object):
@@ -52,14 +55,21 @@ class DynamicResolver(object):
         return answers, authority, additional
 
     def query(self, query, timeout=None):
-        print(f"Recieved {query.name.name.decode()}")
+        logging.info(f"Recieved {query.name.name.decode()}")
         if self._is_resolvable(query):
-            print(f"{query.name.name.decode()} is resolvable")
+            logging.info(f"{query.name.name.decode()} is resolvable")
             return defer.succeed(self._handle_dns_query(query))
         return defer.fail(error.DomainError())
 
 
 def main(opts):
+    logging.basicConfig(
+        handlers=[logging.StreamHandler()],
+        level=logging.INFO,
+        format="%(asctime)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
+
     factory = server.DNSServerFactory(
         caches=[
             cache.CacheResolver(),
@@ -78,10 +88,12 @@ def main(opts):
     protocol = dns.DNSDatagramProtocol(controller=factory)
 
     bind_host, bind_port = opts.bind.split(":")
+    logging.info(f"Binding to {bind_host}:{bind_port}/udp")
     reactor.listenUDP(int(bind_port), protocol, interface=bind_host)
+    logging.info(f"Binding to {bind_host}:{bind_port}/tcp")
     reactor.listenTCP(int(bind_port), factory, interface=bind_host)
 
-    print("Starting server...")
+    logging.info("Starting server...")
     reactor.run()
 
 
