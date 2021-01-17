@@ -1,9 +1,11 @@
 import argparse
 import boto3
-import re
 import json
 import logging
+import time
 
+from functools import partial
+from threading import Thread
 from twisted.internet import reactor, defer
 from twisted.names import client, cache, dns, error, server
 
@@ -11,42 +13,20 @@ logger = logging.getLogger(__name__)
 
 
 class DynamicResolver(object):
-    def __init__(self, aws_credentials_path, aws_tag, regexes, ttl=30):
-        self.aws_tag = aws_tag
-        self.regexes = [re.compile(regex) for regex in regexes]
-        with open(aws_credentials_path, "rb") as fh:
-            self.ec2_clients = [
-                boto3.session.Session(
-                    aws_access_key_id=credentials["aws_access_key_id"],
-                    aws_secret_access_key=credentials["aws_secret_access_key"],
-                    region_name=credentials["aws_region"],
-                ).resource("ec2")
-                for credentials in json.loads(fh.read())
-            ]
+    def __init__(self, hostmap={}, ttl=30):
+        self.hostmap = hostmap
         self.ttl = ttl
 
     def _is_resolvable(self, query):
         if query.type == dns.A:
-            hostname = query.name.name.decode()
-            return any(regex.match(hostname) for regex in self.regexes)
+            return query.name.name.decode() in self.hostmap
         return False
 
     def _handle_dns_query(self, query):
-        ec2_filters = [
-            {"Name": f"tag:{self.aws_tag}", "Values": [query.name.name.decode()]}
-        ]
         answers = [
             dns.RRHeader(
                 name=query.name.name,
-                payload=dns.Record_A(
-                    address=next(
-                        ec2_instance.private_ip_address
-                        for ec2_client in self.ec2_clients
-                        for ec2_instance in ec2_client.instances.filter(
-                            Filters=ec2_filters
-                        )
-                    )
-                ),
+                payload=dns.Record_A(address=self.hostmap[query.name.name.decode()]),
                 ttl=self.ttl,
             )
         ]
@@ -55,11 +35,47 @@ class DynamicResolver(object):
         return answers, authority, additional
 
     def query(self, query, timeout=None):
-        logging.info(f"Recieved {query.name.name.decode()}")
         if self._is_resolvable(query):
-            logging.info(f"{query.name.name.decode()} is resolvable")
+            logging.debug(f"{query.name.name.decode()} is resolvable")
             return defer.succeed(self._handle_dns_query(query))
         return defer.fail(error.DomainError())
+
+
+def serialize_ec2_instance(tag_key, ec2_instance):
+    return (
+        ec2_instance.private_ip_address,
+        next(
+            (tag["Value"] for tag in ec2_instance.tags or [] if tag["Key"] == tag_key),
+            None,
+        ),
+    )
+
+
+def hostmap_updater(aws_credentials_path, tag_key, update_interval, hostmap):
+    logging.info("Starting hostmap updater...")
+
+    with open(aws_credentials_path, "rb") as fh:
+        ec2_clients = [
+            boto3.session.Session(
+                aws_access_key_id=credentials["aws_access_key_id"],
+                aws_secret_access_key=credentials["aws_secret_access_key"],
+                region_name=credentials["aws_region"],
+            ).resource("ec2")
+            for credentials in json.loads(fh.read())
+        ]
+
+    while True:
+        hostmap.update(
+            {
+                name_tag: private_ip_address
+                for ec2_client in ec2_clients
+                for private_ip_address, name_tag in map(
+                    partial(serialize_ec2_instance, tag_key), ec2_client.instances.all()
+                )
+                if name_tag
+            }
+        )
+        time.sleep(update_interval)
 
 
 def main(opts):
@@ -70,17 +86,21 @@ def main(opts):
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
 
+    hostmap = {}
+
+    update_thread = Thread(
+        target=hostmap_updater,
+        args=(opts.aws_credentials_path, opts.tag, opts.update_interval, hostmap),
+        daemon=True,
+    )
+    update_thread.start()
+
     factory = server.DNSServerFactory(
         caches=[
             cache.CacheResolver(),
         ],
         clients=[
-            DynamicResolver(
-                aws_credentials_path=opts.aws_credentials_path,
-                aws_tag=opts.tag,
-                ttl=opts.ttl,
-                regexes=opts.match,
-            ),
+            DynamicResolver(hostmap=hostmap, ttl=opts.ttl),
             client.Resolver(resolv="/etc/resolv.conf"),
         ],
     )
@@ -124,10 +144,10 @@ if __name__ == "__main__":
         help="time the result will remain in cache, in seconds",
     )
     arg_parser.add_argument(
-        "--match",
-        nargs="+",
-        default=[],
-        help="regexs to resolve, if fails regex then default resolver is used",
+        "--update-interval",
+        type=int,
+        default=60,
+        help="frequency of fetching querying ec2 for available hosts, in seconds",
     )
 
     opts = arg_parser.parse_args()
